@@ -424,6 +424,59 @@ func (s *NuiTestSuite) TestStreamMessagesIndexWithNegativeInterval() {
 
 }
 
+func (s *NuiTestSuite) TestStreamMessagesIndexOnWorkQueueStream() {
+	e := s.e
+	connId := s.defaultConn()
+
+	// A WorkQueue stream only allows a single, non-overlapping consumer per
+	// subject. NUI must therefore read messages directly from the stream
+	// instead of creating a consumer, otherwise listing fails with
+	// "multiple non-filtered consumers not allowed on workqueue stream".
+	stream, err := s.js.CreateStream(s.ctx, jetstream.StreamConfig{
+		Name:      "wq_stream",
+		Subjects:  []string{"wq.>"},
+		Storage:   jetstream.MemoryStorage,
+		Retention: jetstream.WorkQueuePolicy,
+	})
+	s.NoError(err)
+	for i := 1; i <= 10; i++ {
+		_, err = s.js.Publish(s.ctx, "wq.high", []byte(fmt.Sprintf("msg%d", i)))
+		s.NoError(err)
+	}
+
+	// Simulate a worker already bound to the subject: this is exactly what made
+	// the previous consumer-based listing fail.
+	_, err = stream.CreateOrUpdateConsumer(s.ctx, jetstream.ConsumerConfig{
+		Durable:       "worker",
+		FilterSubject: "wq.high",
+		AckPolicy:     jetstream.AckExplicitPolicy,
+	})
+	s.NoError(err)
+
+	// Listing all messages works without disturbing the worker.
+	r := e.GET("/api/connection/" + connId + "/stream/wq_stream/messages").
+		Expect().Status(http.StatusOK).JSON().Array()
+	r.Length().IsEqual(10)
+	r.Value(0).Object().Value("seq_num").IsEqual(1)
+	r.Value(0).Object().Value("payload").NotEqual("")
+
+	// Filtering by the very subject the worker consumes also works.
+	e.GET("/api/connection/" + connId + "/stream/wq_stream/messages").
+		WithQueryString("subjects=wq.high").
+		Expect().Status(http.StatusOK).JSON().Array().Length().IsEqual(10)
+
+	// Negative interval (used to load older messages) works too.
+	rNeg := e.GET("/api/connection/" + connId + "/stream/wq_stream/messages").
+		WithQueryString("interval=-3").
+		Expect().Status(http.StatusOK).JSON().Array()
+	rNeg.Length().IsEqual(3)
+	rNeg.Value(0).Object().Value("seq_num").IsEqual(8)
+
+	// The worker consumer is still present and untouched.
+	e.GET("/api/connection/" + connId + "/stream/wq_stream/consumer").
+		Expect().Status(http.StatusOK).JSON().Array().Length().IsEqual(1)
+}
+
 func (s *NuiTestSuite) TestStreamMessagesWithStartTime() {
 	e := s.e
 	connId := s.defaultConn()
